@@ -60,7 +60,11 @@ _fmt := if env_var_or_default("GITHUB_ACTIONS", "") != "true" { "" } else {
     ```
 }
 
-_features := if features != "" { "--no-default-features --features=" + features } else { "" }
+_features := if features == "all" {
+        "--all-features"
+    } else if features != "" {
+        "--no-default-features --features=" + features
+    } else { "" }
 
 #
 # Recipes
@@ -112,12 +116,29 @@ doc-crate crate *flags:
 
 # Run all tests
 test *flags:
-    {{ cargo }} test --workspace --frozen {{ _features }} \
-        {{ if build_type == "release" { "--release" } else { "" } }} \
-        {{ flags }}
+    #!/usr/bin/env bash
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        {{ cargo }} nextest run --workspace --frozen {{ _features }} \
+            {{ if build_type == "release" { "--release" } else { "" } }} \
+            {{ flags }}
+    else
+        {{ cargo }} test --workspace --frozen {{ _features }} \
+            {{ if build_type == "release" { "--release" } else { "" } }} \
+            {{ flags }}
+    fi
 
 test-crate crate *flags:
-    {{ cargo }} test --package={{ crate }} --all-targets --frozen {{ _features }} {{ flags }} {{ _fmt }}
+    #!/usr/bin/env bash
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        {{ cargo }} nextest run --package={{ crate }} --frozen {{ _features }} \
+            {{ if build_type == "release" { "--release" } else { "" } }} \
+            {{ flags }}
+    else
+        {{ cargo }} test --package={{ crate }} --frozen {{ _features }} \
+            {{ if build_type == "release" { "--release" } else { "" } }} \
+            {{ flags }}
+    fi
+
 
 # Build the proxy
 build:
