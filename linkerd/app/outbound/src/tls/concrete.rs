@@ -12,7 +12,6 @@ use linkerd_app_core::{
         prom::{self, EncodeLabelSetMut},
         OutboundZoneLocality,
     },
-    profiles,
     proxy::{
         api_resolve::{ConcreteAddr, Metadata},
         core::Resolve,
@@ -20,7 +19,7 @@ use linkerd_app_core::{
         tcp::{self, balance},
     },
     svc::{self, layer::Layer},
-    tls,
+    tls::{self, ServerName},
     transport::{self, addrs::*},
     transport_header::SessionProtocol,
     Error, Infallible, NameAddr,
@@ -31,9 +30,17 @@ use tracing::info_span;
 /// Parameter configuring dispatcher behavior.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Dispatch {
-    Balance(NameAddr, NameAddr, balance::EwmaConfig),
+    Balance(NameAddr, balance::EwmaConfig),
     Forward(Remote<ServerAddr>, Metadata),
+    /// A backend dispatcher that explicitly fails all requests.
+    Fail {
+        message: Arc<str>,
+    },
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DispatcherFailed(Arc<str>);
 
 /// Wraps errors encountered in this module.
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +65,6 @@ pub type BalancerMetrics = BalancerMetricsParams<ConcreteLabels>;
 /// A target configuring a load balancer stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Balance<T> {
-    logical: NameAddr,
     concrete: NameAddr,
     ewma: balance::EwmaConfig,
     queue: QueueConfig,
@@ -67,7 +73,6 @@ struct Balance<T> {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ConcreteLabels {
-    logical: Arc<str>,
     concrete: Arc<str>,
 }
 
@@ -75,7 +80,6 @@ impl prom::EncodeLabelSetMut for ConcreteLabels {
     fn encode_label_set(&self, enc: &mut prom::encoding::LabelSetEncoder<'_>) -> std::fmt::Result {
         use prom::encoding::EncodeLabel;
 
-        ("logical", &*self.logical).encode(enc.encode_label())?;
         ("concrete", &*self.concrete).encode(enc.encode_label())?;
         Ok(())
     }
@@ -90,7 +94,6 @@ impl prom::encoding::EncodeLabelSet for ConcreteLabels {
 impl<T> svc::ExtractParam<balance::Metrics, Balance<T>> for BalancerMetricsParams<ConcreteLabels> {
     fn extract_param(&self, bal: &Balance<T>) -> balance::Metrics {
         self.metrics(&ConcreteLabels {
-            logical: bal.logical.to_string().into(),
             concrete: bal.concrete.to_string().into(),
         })
     }
@@ -99,7 +102,7 @@ impl<T> svc::ExtractParam<balance::Metrics, Balance<T>> for BalancerMetricsParam
 // === impl Outbound ===
 
 impl<C> Outbound<C> {
-    /// Builds a [`svc::NewService`] stack that builds buffered opaque services
+    /// Builds a [`svc::NewService`] stack that builds buffered tls services
     /// for `T`-typed concrete targets. Connections may be load balanced across
     /// a discovered set of replicas or forwarded to a single endpoint,
     /// depending on the value of the `Dispatch` parameter.
@@ -108,7 +111,7 @@ impl<C> Outbound<C> {
     /// 'failfast'. While in failfast, buffered requests are failed and the
     /// service becomes unavailable so callers may choose alternate concrete
     /// services.
-    pub fn push_opaq_concrete<T, I, R>(
+    pub fn push_tls_concrete<T, I, R>(
         self,
         resolve: R,
     ) -> Outbound<
@@ -118,9 +121,10 @@ impl<C> Outbound<C> {
         >,
     >
     where
-        // Logical target.c
+        // Logical target
         T: svc::Param<Dispatch>,
         T: Clone + Debug + Send + Sync + 'static,
+        T: svc::Param<ServerName>,
         // Server-side socket.
         I: io::AsyncRead + io::AsyncWrite + Debug + Send + Unpin + 'static,
         // Endpoint resolution.
@@ -146,12 +150,7 @@ impl<C> Outbound<C> {
 
             let forward = connect
                 .clone()
-                .push_on_service(
-                    rt.metrics
-                        .proxy
-                        .stack
-                        .layer(stack_labels("opaq", "forward")),
-                )
+                .push_on_service(rt.metrics.proxy.stack.layer(stack_labels("tls", "forward")))
                 .instrument(|e: &Endpoint<T>| info_span!("forward", addr = %e.addr));
 
             let endpoint = connect
@@ -159,9 +158,13 @@ impl<C> Outbound<C> {
                     rt.metrics
                         .proxy
                         .stack
-                        .layer(stack_labels("opaq", "endpoint")),
+                        .layer(stack_labels("tls", "endpoint")),
                 )
                 .instrument(|e: &Endpoint<T>| info_span!("endpoint", addr = %e.addr));
+
+            let fail = svc::ArcNewService::new(|message: Arc<str>| {
+                svc::mk(move |_| futures::future::ready(Err(DispatcherFailed(message.clone()))))
+            });
 
             let inbound_ips = config.inbound_ips.clone();
             let balance = endpoint
@@ -180,37 +183,38 @@ impl<C> Outbound<C> {
                 .lift_new_with_target()
                 .push(tcp::NewBalance::layer(
                     resolve,
-                    rt.metrics.prom.opaq.balance.clone(),
+                    rt.metrics.prom.tls.balance.clone(),
                 ))
                 .push(svc::NewMapErr::layer_from_target::<ConcreteError, _>())
-                .push_on_service(
-                    rt.metrics
-                        .proxy
-                        .stack
-                        .layer(stack_labels("opaq", "balance")),
-                )
+                .push_on_service(rt.metrics.proxy.stack.layer(stack_labels("tls", "balance")))
                 .instrument(|t: &Balance<T>| info_span!("balance", addr = %t.concrete));
 
             balance
+                .push_switch(Ok::<_, Infallible>, forward.into_inner())
                 .push_switch(
                     move |parent: T| -> Result<_, Infallible> {
                         Ok(match parent.param() {
-                            Dispatch::Balance(logical, concrete, ewma) => svc::Either::A(Balance {
-                                logical,
-                                concrete,
-                                ewma,
-                                queue,
-                                parent,
-                            }),
-                            Dispatch::Forward(addr, meta) => svc::Either::B(Endpoint {
-                                addr,
-                                is_local: false,
-                                metadata: meta,
-                                parent,
-                            }),
+                            Dispatch::Balance(concrete, ewma) => {
+                                svc::Either::A(svc::Either::A(Balance {
+                                    concrete,
+                                    ewma,
+                                    queue,
+                                    parent,
+                                }))
+                            }
+
+                            Dispatch::Forward(addr, meta) => {
+                                svc::Either::A(svc::Either::B(Endpoint {
+                                    addr,
+                                    is_local: false,
+                                    metadata: meta,
+                                    parent,
+                                }))
+                            }
+                            Dispatch::Fail { message } => svc::Either::B(message),
                         })
                     },
-                    forward.into_inner(),
+                    svc::stack(fail).check_new_clone().into_inner(),
                 )
                 .push_on_service(tcp::Forward::layer())
                 .push_on_service(drain::Retain::layer(rt.drain.clone()))
@@ -309,7 +313,7 @@ impl<T> svc::Param<Option<SessionProtocol>> for Endpoint<T> {
 
 impl<T> svc::Param<transport::labels::Key> for Endpoint<T>
 where
-    T: svc::Param<Option<profiles::LogicalAddr>>,
+    T: svc::Param<ServerName>,
 {
     fn param(&self) -> transport::labels::Key {
         transport::labels::Key::OutboundClient(self.param())
@@ -318,16 +322,11 @@ where
 
 impl<T> svc::Param<metrics::OutboundEndpointLabels> for Endpoint<T>
 where
-    T: svc::Param<Option<profiles::LogicalAddr>>,
+    T: svc::Param<ServerName>,
 {
     fn param(&self) -> metrics::OutboundEndpointLabels {
-        let authority = self
-            .parent
-            .param()
-            .as_ref()
-            .map(|profiles::LogicalAddr(a)| a.as_http_authority());
         metrics::OutboundEndpointLabels {
-            authority,
+            authority: None,
             labels: metrics::prefix_labels("dst", self.metadata.labels().iter()),
             zone_locality: self.param(),
             server_id: self.param(),
@@ -350,7 +349,7 @@ impl<T> svc::Param<TcpZoneLabels> for Endpoint<T> {
 
 impl<T> svc::Param<metrics::EndpointLabels> for Endpoint<T>
 where
-    T: svc::Param<Option<profiles::LogicalAddr>>,
+    T: svc::Param<ServerName>,
 {
     fn param(&self) -> metrics::EndpointLabels {
         metrics::EndpointLabels::from(svc::Param::<metrics::OutboundEndpointLabels>::param(self))
